@@ -1,149 +1,202 @@
 import { IMessageSDK } from '@photon-ai/imessage-kit'
 import { GoogleGenerativeAI } from '@google/generative-ai'
 import fs from 'fs/promises'
-import path from 'path'
 import dotenv from 'dotenv'
 
-// Load environment variables
 dotenv.config()
 
-// Initialize Gemini AI
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY)
 
-// Initialize SDK (works in both Node.js and Bun)
 const sdk = new IMessageSDK({
     debug: true,
     maxConcurrent: 5,
     watcher: {
-        pollInterval: 3000,        // Check every 3 seconds
-        unreadOnly: false,         // Watch all messages
-        excludeOwnMessages: true   // Exclude own messages
+        pollInterval: 3000,
+        unreadOnly: false,
+        excludeOwnMessages: true
     }
 })
 
-// Function to analyze receipt image with Gemini
-async function analyzeReceipt(imagePath) {
+// FUNCTION 1: Send message
+async function sendMessage(recipient, message) {
     try {
-        const model = genAI.getGenerativeModel({ model: "gemini-flash-latest" })
-        
-        // Read image file
-        const imageData = await fs.readFile(imagePath)
-        const base64Image = imageData.toString('base64')
-        
-        const prompt = `You are a receipt parser. Analyze this receipt image and extract the following information:
-- Each item's name
-- Each item's price
-- Each item's quantity (default to 1 if not specified)
-- The total price
-
-Return ONLY a valid JSON object in this exact format (no markdown, no explanation):
-{
-  "items": [
-    {
-      "name": "Item Name",
-      "quantity": 1,
-      "price": 10.99
+        await sdk.send(recipient, message)
+        console.log(`[SEND] Message sent to ${recipient}`)
+        return { success: true }
+    } catch (error) {
+        console.error(`[SEND ERROR] ${error.message}`)
+        return { success: false, error: error.message }
     }
-  ],
-  "total": 10.99
 }
 
-Make sure all prices are numbers (not strings). If you cannot read the receipt, return {"error": "Could not parse receipt"}.`
+// FUNCTION 2: Parse receipt image
+async function parseReceiptImage(imagePath) {
+    try {
+        const model = genAI.getGenerativeModel({ model: "gemini-flash-latest" })
+        const imageData = await fs.readFile(imagePath)
+        const base64Image = imageData.toString('base64')
+
+        const prompt = `Extract transaction data from this receipt. Return JSON only: {"store":"","location":"","items":[{"name":"","quantity":1,"price":10.99}],"total":10.99}`
 
         const result = await model.generateContent([
             prompt,
-            {
-                inlineData: {
-                    data: base64Image,
-                    mimeType: 'image/jpeg'
-                }
-            }
+            { inlineData: { data: base64Image, mimeType: 'image/jpeg' } }
         ])
-        
-        const response = await result.response
-        const text = response.text()
-        
-        // Try to parse JSON from response
-        let jsonText = text.trim()
-        // Remove markdown code blocks if present
-        jsonText = jsonText.replace(/```json\n?/g, '').replace(/```\n?/g, '')
-        
-        return JSON.parse(jsonText)
+
+        const text = result.response.text().trim().replace(/```json\n?/g, '').replace(/```\n?/g, '')
+        const data = JSON.parse(text)
+
+        console.log(`[PARSE] Success`)
+        return { success: true, data }
     } catch (error) {
-        console.error('Error analyzing receipt:', error)
-        return { error: 'Failed to analyze receipt: ' + error.message }
+        console.error(`[PARSE ERROR] ${error.message}`)
+        return { success: false, error: error.message }
     }
 }
 
-// Function to process incoming messages
-async function handleMessage(message) {
-    const { sender, text, attachments } = message
-    
-    console.log(`\n📨 New message from ${sender}`)
-    console.log(`Text: ${text || 'No text'}`)
-    console.log(`Attachments: ${attachments?.length || 0}`)
-    
-    // Check if message has image attachments
-    if (attachments && attachments.length > 0) {
-        for (const attachment of attachments) {
-            // Check if it's an image
-            if (attachment.mimeType?.startsWith('image/')) {
-                console.log(`\n🖼️  Processing receipt image: ${attachment.filename}`)
+// FUNCTION 3: Search nearby places using Gemini with Google Search grounding
+async function searchNearbyPlaces(query, location) {
+    try {
+        console.log(`[SEARCH] ${query} near ${location}`)
+
+        const model = genAI.getGenerativeModel({
+            model: "gemini-2.0-flash-exp",
+            tools: [{ googleSearch: {} }]
+        })
+        
+        const prompt = `Find 3 cheap ${query} near ${location}. 
+
+List them as:
+1. [Name] - [Price] - [One sentence why]
+2. [Name] - [Price] - [One sentence why]
+3. [Name] - [Price] - [One sentence why]
+
+Just the numbered list, nothing else.`
+
+        const result = await model.generateContent(prompt)
+        let responseText = result.response.text()
+        
+        // Remove markdown formatting
+        responseText = responseText
+            .replace(/\*\*/g, '')  // Remove bold **
+            .replace(/\*/g, '')    // Remove italic *
+            .replace(/#{1,6}\s/g, '')  // Remove headers
+            .replace(/\[([^\]]+)\]\([^\)]+\)/g, '$1')  // Remove links, keep text
+        
+        console.log(`[SEARCH] Cleaned result:`, responseText)
+
+        // Parse the result - extract numbered lines
+        const places = []
+        const lines = responseText.split('\n')
+
+        for (const line of lines) {
+            const match = line.match(/^\s*(\d+)[\.\)]\s*(.+)/)
+            if (match) {
+                const rank = parseInt(match[1])
+                const content = match[2].trim()
                 
-                try {
-                    // Analyze the receipt
-                    const receiptData = await analyzeReceipt(attachment.path)
+                places.push({
+                    rank: rank,
+                    name: content.split('-')[0]?.trim() || content.substring(0, 50),
+                    description: content,
+                    url: ''
+                })
+            }
+        }
+
+        if (places.length === 0) {
+            // Fallback: return raw text
+            return {
+                success: true,
+                places: [{
+                    rank: 1,
+                    name: `${query} near ${location}`,
+                    description: responseText.replace(/\n+/g, ' ').substring(0, 200),
+                    url: ''
+                }]
+            }
+        }
+
+        console.log(`[SEARCH] Found ${places.length} places`)
+        return { success: true, places: places.slice(0, 3) }
+    } catch (error) {
+        console.error(`[SEARCH ERROR] ${error.message}`)
+        return { success: false, error: error.message }
+    }
+}
+
+// FUNCTION 4: Send recommendation
+async function sendRecommendation(recipient, query, location) {
+    try {
+        console.log(`[RECOMMENDATION] Searching for ${query} near ${location}`)
+        
+        const result = await searchNearbyPlaces(query, location)
+        
+        if (result.success) {
+            let message = `Affordable ${query} near ${location}:\n\n`
+            result.places.forEach(p => {
+                message += `${p.rank}. ${p.name}\n${p.description.trim()}\n\n`
+            })
+            await sendMessage(recipient, message)
+            console.log(`[RECOMMENDATION] Sent to ${recipient}`)
+            return { success: true }
+        } else {
+            await sendMessage(recipient, `Sorry, couldn't find ${query} near ${location}`)
+            return { success: false, error: result.error }
+        }
+    } catch (error) {
+        console.error(`[RECOMMENDATION ERROR] ${error.message}`)
+        return { success: false, error: error.message }
+    }
+}
+
+// Start bot
+console.log('[START] Piggy bot initialized\n')
+
+const TEST_NUMBER = process.env.TEST_NUMBER || '+15514049519'
+await sendMessage(TEST_NUMBER, "Hi! I'm Piggy. I'm online!")
+
+// Send recommendation for cheap coffee spots at Princeton
+await sendRecommendation(TEST_NUMBER, 'coffee', 'Princeton University')
+
+await sdk.startWatching({
+    onNewMessage: async (msg) => {
+        console.log(`\n[MSG] From: ${msg.sender}`)
+        console.log(`[MSG] Attachments: ${msg.attachments?.length || 0}`)
+        
+        // Only handle images (receipts)
+        if (msg.attachments?.length > 0) {
+            for (const att of msg.attachments) {
+                if (att.mimeType?.startsWith('image/')) {
+                    console.log('[IMAGE] Processing receipt')
+                    const result = await parseReceiptImage(att.path)
                     
-                    if (receiptData.error) {
-                        await sdk.send(sender, `❌ Error: ${receiptData.error}`)
-                    } else {
-                        // Format the response
-                        let response = '🧾 Receipt Analysis:\n\n'
-                        
-                        if (receiptData.items && receiptData.items.length > 0) {
-                            response += 'Items:\n'
-                            receiptData.items.forEach((item, index) => {
-                                response += `${index + 1}. ${item.name}\n`
-                                response += `   Qty: ${item.quantity} × $${item.price.toFixed(2)}\n`
+                    if (result.success) {
+                        const d = result.data
+                        let resp = `Receipt Analysis\n\n`
+                        if (d.store) resp += `Store: ${d.store}\n`
+                        if (d.location) resp += `Location: ${d.location}\n\n`
+                        if (d.items?.length > 0) {
+                            resp += `Items:\n`
+                            d.items.forEach((item, i) => {
+                                resp += `${i + 1}. ${item.name} - Qty: ${item.quantity} x $${item.price.toFixed(2)}\n`
                             })
-                            response += `\n💰 Total: $${receiptData.total.toFixed(2)}`
-                        } else {
-                            response += 'No items found in receipt.'
+                            resp += `\nTotal: $${d.total.toFixed(2)}`
                         }
-                        
-                        // Send formatted response
-                        await sdk.send(sender, response)
-                        
-                        // Also log the JSON
-                        console.log('\n📊 Receipt JSON:')
-                        console.log(JSON.stringify(receiptData, null, 2))
+                        await sendMessage(msg.sender, resp)
                     }
-                } catch (error) {
-                    console.error('Error processing receipt:', error)
-                    await sdk.send(sender, '❌ Sorry, I had trouble processing that receipt.')
                 }
             }
         }
-    } else if (text) {
-        // Handle text-only messages
-        await sdk.send(sender, '📸 Please send me a receipt image to analyze!')
-    }
-}
-
-// Start watching for new messages
-console.log('\n✅ Bot is running and listening for messages...')
-console.log('💡 Send a receipt image to process it!\n')
-
-await sdk.startWatching({
-    onNewMessage: handleMessage,
+    },
+    
     onError: (error) => {
-        console.error('❌ Watcher error:', error)
+        console.error('[ERROR]', error.message)
     }
 })
 
-// Handle graceful shutdown
 process.on('SIGINT', async () => {
-    console.log('\n\n👋 Shutting down...')
+    console.log('\n[STOP] Shutting down')
     sdk.stopWatching()
     await sdk.close()
     process.exit(0)
