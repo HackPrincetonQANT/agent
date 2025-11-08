@@ -19,6 +19,8 @@
   "homepage": "https://github.com/HackPrincetonQANT/agent#readme",
   "dependencies": {
     "@photon-ai/imessage-kit": "^1.1.3",
-    "better-sqlite3": "^12.4.1"
+    "better-sqlite3": "^12.4.1",
+    "@google/generative-ai": "^0.21.0",
+    "dotenv": "^16.4.5"
   }
 }
